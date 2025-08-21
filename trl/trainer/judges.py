@@ -183,7 +183,490 @@ class BaseBinaryJudge(BaseJudge):
         """
         raise NotImplementedError("Judge subclasses must implement the `judge` method.")
 
+import hashlib, json, re
+from datetime import datetime
+from typing import Dict
 
+def get_prompt_hash(prompt: str) -> str:
+    """
+    将prompt转换为SHA-1哈希值
+    
+    Args:
+        prompt: 输入的prompt字符串
+        
+    Returns:
+        SHA-1哈希值的十六进制字符串
+    """
+    return hashlib.sha1(prompt.encode('utf-8')).hexdigest()
+
+
+def sanitize_json_string(json_str):
+    """
+    处理包含未转义双引号和多行代码的 JSON 字符串
+    
+    Args:
+        json_str: 原始 JSON 字符串
+    Returns:
+        dict: 解析后的字典
+    """
+    # 1. 首先尝试提取三个主要部分
+    try:
+        # 使用非贪婪匹配和多行模式
+        pattern = (
+            r'"gt_retention":\s*(\d+),\s*'
+            r'"gt_retention_code":\s*"(.*?)",\s*'
+            r'"reason":\s*"(.*?)"}'
+        )
+        match = re.search(pattern, json_str, re.DOTALL)
+        
+        if not match:
+            raise ValueError("Invalid JSON string format")
+            
+        gt_retention = int(match.group(1))
+        gt_retention_code = match.group(2)
+        reason = match.group(3)
+        
+        # 2. 处理代码中的双引号和换行
+        # 替换所有未转义的双引号
+        gt_retention_code = re.sub(r'(?<!\\)"', r'\"', gt_retention_code)
+        # 处理换行符
+        gt_retention_code = gt_retention_code.replace('\n', '\\n').replace('\r', '')
+        
+        # 3. 处理 reason 中的双引号
+        reason = reason.replace('"', '\\"')
+        
+        # 4. 构建新的 JSON 字符串
+        cleaned_json = (
+            '{{'
+            '"gt_retention": {}, '
+            '"gt_retention_code": "{}", '
+            '"reason": "{}"'
+            '}}'
+        ).format(gt_retention, gt_retention_code, reason)
+        
+        # 5. 解析成字典
+        return json.loads(cleaned_json)
+        
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse JSON: {e}")
+    except Exception as e:
+        raise ValueError(f"Error processing JSON string: {e}")
+
+def sanitize_json_string2(json_str):
+    """
+    处理包含未转义双引号、转义字符和多行代码的 JSON 字符串
+    
+    Args:
+        json_str: 原始 JSON 字符串
+    Returns:
+        dict: 解析后的字典
+    """
+    try:
+        # 1. 首先尝试直接解析
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+        
+        # 2. 如果直接解析失败，尝试提取各个部分
+        pattern = (
+            r'"gt_retention":\s*(\d+),\s*'
+            r'"gt_retention_code":\s*"(.*?)",\s*'
+            r'"reason":\s*"(.*?)"}'
+        )
+        match = re.search(pattern, json_str, re.DOTALL)
+        
+        if not match:
+            raise ValueError("Invalid JSON string format")
+            
+        gt_retention = int(match.group(1))
+        gt_retention_code = match.group(2)
+        reason = match.group(3)
+        
+        # 3. 预处理字符串
+        # 处理已经转义的序列
+        gt_retention_code = gt_retention_code.replace(r'\\', '___BACKSLASH___')
+        gt_retention_code = gt_retention_code.replace(r'\n', '___NEWLINE___')
+        gt_retention_code = gt_retention_code.replace(r'\t', '___TAB___')
+        gt_retention_code = gt_retention_code.replace(r'\r', '___RETURN___')
+        gt_retention_code = gt_retention_code.replace(r'\"', '___QUOTE___')
+        
+        # 处理未转义的双引号
+        gt_retention_code = gt_retention_code.replace('"', '\\"')
+        reason = reason.replace('"', '\\"')
+        
+        # 还原转义序列
+        gt_retention_code = gt_retention_code.replace('___BACKSLASH___', '\\\\')
+        gt_retention_code = gt_retention_code.replace('___NEWLINE___', '\\n')
+        gt_retention_code = gt_retention_code.replace('___TAB___', '\\t')
+        gt_retention_code = gt_retention_code.replace('___RETURN___', '\\r')
+        gt_retention_code = gt_retention_code.replace('___QUOTE___', '\\"')
+        
+        # 4. 构建结果字典
+        result = {
+            "gt_retention": gt_retention,
+            "gt_retention_code": gt_retention_code,
+            "reason": reason
+        }
+        
+        # 5. 验证结果
+        json.dumps(result)  # 如果有问题会抛出异常
+        return result
+        
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse JSON: {e}")
+    except Exception as e:
+        raise ValueError(f"Error processing JSON string: {e}")
+def extract_gt_retention(completion: str):
+    """
+    从模型输出中提取gt_retention字段值
+    
+    Args:
+        completion: 模型的输出字符串
+        
+    Returns:
+        gt_retention的值，如果解析失败返回None
+    """
+    
+    json_data = None
+    gt_retention, gt_retention_code, reason = -1, '', ''
+    
+    try:
+        # 尝试从文本中提取JSON部分
+        # 查找可能的JSON格式内容
+        json_pattern = r'\{[^{}]*"gt_retention"[^{}]*\}'
+        matches = re.findall(json_pattern, completion, re.DOTALL)
+        for match in matches:
+            try:
+                json_data = json.loads(match)
+                # if 'gt_retention' in json_data:
+                #     return json_data['gt_retention']
+                if json_data is not None and 'gt_retention' in json_data:
+                    break
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        pass
+    
+    # 第一种解析方法
+    try:
+        if json_data is None or 'gt_retention' not in json_data or 'gt_retention_code' not in json_data or 'reason' not in json_data:
+            fixed_json = completion.split('```json\n', 1)[-1]
+            fixed_json = fixed_json.replace('```', '')
+            # 仅转义字符串值内的换行符（非结构换行）
+            fixed_json = re.sub(
+                r'("[^"]*")', 
+                lambda m: m.group(0).replace('\n', '\\\\n'), 
+                fixed_json
+            )
+            json_data = json.loads(fixed_json, strict=False) #
+    except Exception as e:
+        print(f'[Error-1] {datetime.now()} fail to convert completion to json_data "{json_data}": {e}')
+
+    # 第二种解析方法
+    try:
+        if json_data is None or 'gt_retention' not in json_data or 'gt_retention_code' not in json_data or 'reason' not in json_data:
+            fixed_json = re.sub(r'^```json\s*|\s*```$', '', completion, flags=re.DOTALL).strip()
+            # 修复字符串值内的特殊字符
+            def fix_json_string(match):
+                s = match.group(1)
+                # 转义双引号（但保留已转义的双引号）
+                s = re.sub(r'(?<!\\)"', r'\\"', s)
+                # 转义换行符
+                s = s.replace('\n', '\\n')
+                # 转义反斜杠（但保留已转义的）
+                s = re.sub(r'(?<!\\)\\', r'\\\\', s)
+                return f'"{s}"'
+            # 处理所有字符串值
+            fixed_json = re.sub(
+                r'"((?:[^"\\]|\\.)*)"', 
+                fix_json_string, 
+                fixed_json,
+                flags=re.DOTALL
+            )
+            json_data = json.loads(fixed_json) # # strict=False
+        
+    except Exception as e:
+        print(f'[Error-2] {datetime.now()} fail to convert completion to json_data "{json_data}": {e}')
+    
+    # 第三种解析方法
+    try:
+        if json_data is None or 'gt_retention' not in json_data or 'gt_retention_code' not in json_data or 'reason' not in json_data:
+            json_data = sanitize_json_string(completion)
+    except Exception as e:
+        print(f'[Error-3] {datetime.now()} fail to convert completion to json_data "{json_data}": {e}')
+    
+    # 第四种 json 解析方法
+    try:
+        if json_data is None or 'gt_retention' not in json_data or 'gt_retention_code' not in json_data or 'reason' not in json_data:
+            json_data = sanitize_json_string2(completion)
+    except Exception as e:
+        print(f'[Error-4] {datetime.now()} fail to convert completion to json_data "{json_data}": {e}')
+    
+    if json_data is not None and 'gt_retention' in json_data and 'gt_retention_code' in json_data and 'reason' in json_data:
+        gt_retention = json_data['gt_retention']
+        gt_retention_code = json_data['gt_retention_code']
+        reason = json_data['reason']
+        
+    # 第五种保底评价结果提取方法, split 硬截取
+    try:
+        if gt_retention==-1:
+            if '"gt_retention"' in completion:
+                text = completion.split('"gt_retention"')[1]
+                if '"gt_retention_code"' in text:
+                    text = text.split('"gt_retention_code"')
+                    if '0' in text[0]:
+                        gt_retention=0
+                    elif '1' in text[0]:
+                        gt_retention=1
+                    elif '2' in text[0]:
+                        gt_retention=2
+                    if '"reason"' in text[1]:
+                        text = text[1].split('"reason"')
+                        first_quote = text[0].find('"')  # 找到第一个双引号的位置
+                        last_quote = text[0].rfind('"')  # 找到最后一个双引号的位置
+                        # 如果找到双引号，去掉第一个和最后一个双引号
+                        if first_quote != -1 and last_quote != -1:
+                            gt_retention_code = text[0][first_quote + 1:last_quote]
+                        first_quote = text[1].find('"')  
+                        last_quote = text[1].rfind('"')
+                        if first_quote != -1 and last_quote != -1:
+                            reason = text[1][first_quote + 1:last_quote]
+    except Exception as e:
+        print(f"extract_gt_retention() exception: {e} completion={[completion]}")
+
+    if gt_retention==-1:
+        print(f'[Error-5] {datetime.now()} finally fail to convert completion "{[completion]}" to json_data="{json_data}"')
+    else:
+        print(f'extract_gt_retention(): extract successfully, gt_retention={gt_retention}')
+    return gt_retention, gt_retention_code, reason
+    
+class CustomBinaryJudge(BaseBinaryJudge):
+    """
+    自定义的二进制评判器，根据prompt的SHA-1哈希值查找真值集并比较模型输出结果
+    """
+    
+    def __init__(self, ground_truth_dict: Dict[str, Dict[str, any]]):
+        """
+        初始化评判器
+        
+        Args:
+            ground_truth_dict: 真值集字典，key为prompt的SHA-1哈希值，value为期望的原始 item 字典
+        """
+        self.ground_truth_dict = ground_truth_dict
+    
+    def judge(
+        self,
+        prompts: list[str],
+        completions: list[str],
+        gold_completions: Optional[list[str]] = None,
+        shuffle_order: bool = True,
+    ) -> list[int]:
+        """
+        评判模型输出结果
+        
+        Args:
+            prompts: 输入的prompt列表
+            completions: 模型输出的completion列表
+            gold_completions: 黄金标准completion列表（本实现中不使用）
+            shuffle_order: 是否打乱顺序（本实现中不使用）
+            
+        Returns:
+            评判结果列表，1表示正确，0表示错误（包括解析错误），-1表示评判失败
+        """
+        results = []
+        for prompt, completion in zip(prompts, completions):
+            try:
+                # 1. 将prompt转换为SHA-1哈希值
+                if prompt.startswith('User: '):
+                    prompt=prompt[6:]
+                if prompt.endswith('\n\n\n'):
+                    prompt=prompt[:-2]
+                prompt_hash = get_prompt_hash(prompt)
+                
+                # 2. 查找真值集中的期望值
+                expected_value = self.ground_truth_dict.get(prompt_hash)
+                
+                if expected_value is None:
+                    # 如果真值集中没有对应的key，返回-1表示无法评判
+                    results.append(-1)
+                    print(f'[Error] {datetime.now()} judge(): prompt_hash={prompt_hash} not in ground_truth_dict, prompts={prompts}')
+                    continue
+                
+                # 3. 从模型输出中提取gt_retention值
+                actual_value, _, _ = extract_gt_retention(completion)
+                print(f'read actual_value={actual_value}, expected_value={expected_value}')
+                
+                # 4. 比较期望值和实际值
+                if expected_value == actual_value:
+                    results.append(1)  # 正确
+                else:
+                    results.append(0)  # 错误
+                    
+            except Exception as e:
+                # 处理任何其他异常
+                print(f"评判过程中出现异常: {e}")
+                results.append(-1)
+
+        return results
+
+class CustomPairRMJudge(BasePairwiseJudge):
+    """
+    This judge uses the PairRM model to rank pairs of completions for given prompts. It's designed for pairwise
+    comparison of language model outputs. 
+    **Example**:
+    ```python
+    >>> pairrm_judge = PairRMJudge()
+    >>> prompts = ["Translate 'hello' to French", "What's the capital of Japan?"]
+    >>> completions = [["Bonjour", "Salut"], ["Kyoto", "Tokyo"]]
+    >>> results = pairrm_judge.judge(prompts, completions)
+    >>> print(results)  # [0, 1] (indicating the first completion is preferred for the first prompt)
+    ```
+    """
+
+    def __init__(self, ground_truth_dict: Dict[str, Dict[str, any]]):
+        self.ground_truth_dict = ground_truth_dict
+
+    def judge(
+        self,
+        prompts: list[str],
+        completions: list[list[str]],
+        shuffle_order: bool = False,
+    ) -> list[Union[int, float]]:
+        """
+        Judge the completion pairs for the given prompts using the PairRM model.
+
+        Args:
+            prompts (`list[str]`):
+                List of prompts to judge.
+            completions (`list[list[str]]`):
+                List of completion pairs for each prompt.
+            shuffle_order (`bool`, *optional*, defaults to `True`):
+                Whether to shuffle the order of the completions to avoid positional bias.
+            return_scores (`bool`, *optional*, defaults to `False`):
+                If `True`, return probability scores of the first completion instead of ranks (i.e. a *soft-judge*).
+        Returns:
+            `Union[list[int, float]]`:
+                If `return_scores` is `False`, returns a list of ranks (`0` or `1`) for each prompt, indicating which
+                completion is preferred. If `return_scores` is `True`, returns softmax probabilities for the first
+                completion.
+        Raises:
+            `ValueError`:
+                If the number of completions per prompt is not exactly 2.
+        """
+
+        if len(completions[0]) != 2:
+            raise ValueError("PairRM judge requires exactly 2 completions per prompt.")
+
+        # Shuffle the order of the completions to avoid positional bias
+        if shuffle_order:
+            flip_mask = np.random.choice([True, False], size=len(prompts))
+            completions = [pair[::-1] if flip else pair for flip, pair in zip(flip_mask, completions)]
+
+        # Rank the completions
+        ranks = []
+        for prompt, (c1,c2) in zip(prompts, completions):
+            try:
+                # 1. 将prompt转换为SHA-1哈希值
+                if prompt.startswith('User: '):
+                    prompt=prompt[6:]
+                if prompt.endswith('\n\n\n'):
+                    prompt=prompt[:-2]
+                prompt_hash = get_prompt_hash(prompt)
+                
+                # 2. 从模型输出中提取gt_retention值
+                g1, co1, r1  = extract_gt_retention(c1) # 状态码，推荐代码，原因
+                g2, co2, r2 = extract_gt_retention(c2)
+                
+                # 3. 查找真值集中的期望值
+                gt = self.ground_truth_dict.get(prompt_hash)
+                # 真值读取失败
+                if gt is None or 'gt_retention' not in gt or gt['gt_retention'] not in [0,1,2] or 'gt_retention_code' not in gt or 'reason' not in gt:
+                    if g1==-1 and g2 in [0,1,2]: # 按流畅度评判
+                        ranks.append(1)
+                    elif g1 in [0,1,2] and g2==-1:
+                        ranks.append(0)
+                    else: # 真值集中没有对应的key，返回-1表示无法评判
+                        ranks.append(-1)
+                    print(f'[Error] {datetime.now()} judge(): read prompt_hash={prompt_hash} failed in ground_truth_dict, gt={gt}, g1={g1}, g2={g2}, prompts={prompts}')
+                    continue
+                
+                gt_retention, gt_retention_code, gt_reason = gt['gt_retention'], gt['gt_retention_code'], gt['reason']
+                if gt_retention==1 and gt_retention_code=='':
+                    gt_retention_code = gt['retention_code']
+                print(f'read actual_value_1={g1}, actual_value_2={g2}, expected_value={gt_retention}')
+                
+                # 4. 比较期望值和实际值
+                if gt_retention==g1 and g1==g2: # 都是 0/1/2
+                    if gt_retention==1:
+                        if co1==gt_retention_code:
+                            if co2!=gt_retention_code:
+                                print(f'co1==gt_retention_code, co2!=gt_retention_code, judge 0')
+                                ranks.append(0)
+                            elif len(r1)>len(r2):
+                                print(f'co1==gt_retention_code, co2==gt_retention_code, len(r1)>len(r2), judge 0')
+                                ranks.append(0)
+                            else:
+                                print(f'co1==gt_retention_code, co2==gt_retention_code, len(r1)<=len(r2), judge 1')
+                                ranks.append(1)
+                        elif co2==gt_retention_code:
+                            print(f'co2==gt_retention_code, co1!=gt_retention_code, judge 1')
+                            ranks.append(1)
+                        elif len(r1)>len(r2):
+                            print(f'gt_retention_code!=co1!=co2, len(r1)>len(r2), judge 0')
+                            ranks.append(0)
+                        else:
+                            print(f'gt_retention_code!=co1!=co2, len(r1)<=len(r2), judge 1')
+                            ranks.append(1)
+                    elif gt_retention==0: # 这里开始简略了
+                        if co1==gt_retention_code:
+                            ranks.append(1)
+                        elif co2==gt_retention_code:
+                            ranks.append(0)
+                        elif len(r1)>len(r2):
+                            ranks.append(0)
+                        else:
+                            ranks.append(1)
+                    elif gt_retention==2:
+                        if co1=='':
+                            ranks.append(0)
+                        elif co2=='':
+                            ranks.append(1)
+                        elif len(r1)>len(r2):
+                            ranks.append(0)
+                        else:
+                            ranks.append(1)
+                    else:
+                        ranks.append(-1) # 不可能出现
+                        
+                elif gt_retention!=g1 and g1==g2: # 犯了相同的错误
+                    print(f'Error: 犯了相同的错误，应该回退，gt_retention={gt_retention}, g1={g1}, g2={g2}')
+                    tmp_dict = {
+                        'gt_retention': gt_retention,
+                        'gt_retention_code': gt_retention_code,
+                        'reason': gt_reason
+                    }
+                    ranks.append(json.dumps(tmp_dict, ensure_ascii=False))
+                
+                elif gt_retention==g1 or g2==-1 or (gt_retention==0 and g1==2 and g2==1) or (gt_retention==1 and g1==2 and g2==0) or (gt_retention==2 and g1==1 and g2==0):
+                    ranks.append(0)
+                elif gt_retention==g2 or g1==-1 or (gt_retention==0 and g1==1 and g2==2) or (gt_retention==1 and g1==0 and g2==2) or (gt_retention==2 and g1==0 and g2==1):
+                    ranks.append(1)
+                else:
+                    print(f'Error: 不可能出现，gt_retention={gt_retention}, g1={g1}, g2={g2}')
+                    ranks.append(-1)
+            except Exception as e:
+                # 处理任何其他异常
+                print(f"评判过程中出现异常: {e}")
+                ranks.append(-1)
+            
+        
+        # Flip back the ranks or scores to the original order if needed
+        if shuffle_order:
+            ranks = [ranks[i] if not flip else 1 - ranks[i] for i, flip in enumerate(flip_mask)]
+        
+        return ranks
+        
 class PairRMJudge(BasePairwiseJudge):
     """
     LLM judge based on the PairRM model from AllenAI.

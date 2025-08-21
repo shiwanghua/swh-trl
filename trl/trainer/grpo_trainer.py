@@ -1,3 +1,5 @@
+from unsloth import FastLanguageModel
+
 # Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,12 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
+import json,hashlib
 import copy
 import inspect
 import os
 import re
 import textwrap
 import warnings
+from datetime import datetime
 from collections import defaultdict, deque
 from collections.abc import Sequence, Sized
 from contextlib import nullcontext
@@ -32,6 +37,7 @@ import transformers
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from datasets import Dataset, IterableDataset
 from packaging import version
+from sentence_transformers import CrossEncoder
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
@@ -519,6 +525,36 @@ class GRPOTrainer(Trainer):
 
     _tag_names = ["trl", "grpo"]
 
+    def construct_msg(self, lang, head, retention_code, tail, clipboard_info, code_diff, code_file_path):
+        return f"""你是一个编程代码评价工程师，专门检查实时补全的代码是否正确，识别出那些错误补全的情况以方便后续改进代码补全模型。
+
+根据以下<context>标签之间的信息，判断其中补全的 {lang} 代码是否正确，<context> 标签内字段的每个值前后都加上 <begin> 和 <end> 标签，避免不知道起止边界。
+
+<context>
+上文: <begin>{head}<end>
+
+补全代码: <begin>{retention_code}<end>
+
+下文: <begin>{tail}<end>
+
+剪切板信息: <begin>{clipboard_info}<end>
+
+diff信息: <begin>{code_diff}<end>
+
+代码文件路径: <begin>{code_file_path}<end>
+<context>
+
+只输出一个 json 格式的结果，不带其他内容，json 里只包含三个字段，即 "gt_retention", "gt_retention_code" 和 "reason"，赋值规则如下：
+
+（1）如果补全的代码是错误的，则 "gt_retention" 的值设为 0，此时需要生成正确的补全代码，赋值给 "gt_retention_code"，并在 "reason" 的值里用中文给出错误原因和正确的补全逻辑。
+
+（2）如果补全的代码是正确的，则 "gt_retention" 的值设为 1，"gt_retention_code" 可以给出更准确完整的补全代码，"reason" 里给出补全正确的原因，注意只要续写的代码逻辑合理，暂时存在一些语法错误、编译错误、无意义冗余现象等不完整代码导致的缺陷是可以容忍的，此时也算补全正确。
+
+（3）如果根据所提供信息无法判断补全代码的正确性，有争议性，或者上下文代码量小且逻辑简单，作为一个补全案例没有什么参考价值，不适合作为代码补全模型的训练数据，则丢弃该样本，将 "gt_retention" 的值设为 2，"gt_retention_code" 设为空字符串，"reason" 里给出无法判断的原因。
+
+（4）可能根据现有信息判断出待补全代码和业务逻辑相关，意图不明，此时应该主动放弃进行代码补全，如果补全代码非空，则判断为补全错误，"gt_retention" 应该赋为 0，"gt_retention_code" 为空字符串，"reason" 里说明此时不适合进行代码补全的原因。
+"""
+
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
@@ -531,7 +567,33 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        val_file_path: str = '/home/ubisec/swh/codes/AssessModel/data/confirm_mark_completion_data_20250609/confirm_mark_c_cpp_completion_detail_20250609.json',
     ):
+        # 读取人工标记的评价结果作为真值集
+        self.validate_data = dict()
+        it = 0
+        for item in json.load(open(val_file_path, 'r', encoding='utf-8'))['RECORDS']:
+            if item['confirm']==1 and item['gt_retention']!=3:
+                # self.validate_data.add(item['code_id']+str(len(item['head'])*100000000+len(item['tail'])*10000+len(item['retention_code'])*100+len(item['reason'])))
+                lang = item['lang']
+                head = item['head']
+                retention_code = item['retention_code']
+                tail = item['tail']
+                clipboard_info = item['clipboard_info'][:4096] if item['clipboard_info'] is not None else ''
+                code_diff = item['code_diff']
+                code_file_path = item['file_path']
+                prompt = self.construct_msg(lang, head, retention_code, tail, clipboard_info, code_diff, code_file_path)
+                it+=1
+                hash_prompt = hashlib.sha1(prompt.encode('utf-8')).hexdigest()
+                # prompt = [prompt]
+                # if it==443:
+                #     print(f'it={it}, hash_prompt={hash_prompt}, prompt={prompt}')
+                self.validate_data[hash_prompt] = item
+        print(f'[INFO] read {len(self.validate_data)} confirm data for validation.')
+        
+        self.reason_quality_model = CrossEncoder("/home/ubisec/swh/models/cross-encoder_stsb-roberta-base")
+        # self.reason_quality_model = None
+        
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
@@ -555,9 +617,22 @@ class GRPOTrainer(Trainer):
                     f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
                 )
             # Disable caching if gradient checkpointing is enabled (not supported)
-            config = AutoConfig.from_pretrained(model_id)
-            architecture = getattr(transformers, config.architectures[0])
-            model = architecture.from_pretrained(model_id, **model_init_kwargs)
+            model_init_kwargs["use_cache"] = (
+                False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
+            )
+            # config = AutoConfig.from_pretrained(model_id)
+            # architecture = getattr(transformers, config.architectures[0])
+            # model = architecture.from_pretrained(model_id, **model_init_kwargs)
+            # model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+            
+            model, processing_class = FastLanguageModel.from_pretrained(
+                model_name=model,
+                max_seq_length=args.max_prompt_length + args.max_completion_length,
+                dtype=torch.bfloat16,            # float16 / bfloat16
+                load_in_4bit=True,     # 显存立省 70 %[^31^]
+            )
+            print(f'{datetime.now()} FastLanguageModel loaded with model_id: {model_id}')
+
         else:
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
@@ -566,6 +641,7 @@ class GRPOTrainer(Trainer):
                     "This argument can only be used when the `model` argument is a string."
                 )
 
+        self.use_lora = False
         # Some models (SmolVLM/Idefics3) don't support `logits_to_keep` argument and error out if we pass it
         # Inspect the forward method before we wrap the model with PEFT
         self.model_kwarg_keys = (
@@ -577,8 +653,50 @@ class GRPOTrainer(Trainer):
         if peft_config is not None:
             if not is_peft_available():
                 raise ImportError("PEFT is required to use `peft_config`. Run `pip install peft`.")
-            model = get_peft_model(model, peft_config)
-
+            # model = get_peft_model(model, peft_config)
+            
+            # model = FastLanguageModel.get_peft_model(
+            #     model,
+            #     r=16,
+            #     lora_alpha=32,
+            #     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            #     lora_dropout=0,
+            #     bias="none",
+            #     # use_rslora=True,
+            #     # use_gradient_checkpointing="unsloth",  # 再省显存
+            #     # random_state=3407,
+            # )
+            
+            from peft import LoraConfig, TaskType
+            lora_config = LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=None, # ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+                lora_dropout=0,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM,  # 指定任务类型
+                modules_to_save=None,          # 明确设置为 None
+                use_rslora=False,              # 禁用 RSLoRA
+                use_dora=False,                # 禁用 DoRA
+            )
+            model = get_peft_model(model, lora_config)
+            for n, p in model.named_parameters():
+                if "lora" in n:
+                    p.data = p.data.to(torch.bfloat16)
+                    print(f'{datetime.now()} LoRA parameter: {n}, shape: {p.shape}, requires_grad: {p.requires_grad}, to bf16')
+            #         p.data = p.data.to(torch.float16)
+                # else:
+                #     p.data = p.data.to(torch.bfloat16)
+                #     print(f'{datetime.now()} Not LoRA Parameter: {n}, shape: {p.shape}, requires_grad: {p.requires_grad}, to bf16')
+            
+            # model.save_pretrained_merged(
+            #     "/home/ubisec/swh/train_models/DS-R1-0528-Qwen3-8B_cpp_completion_20250609_lora-gspo_model5_init",          # 输出目录
+            #     processing_class,               # 对应 tokenizer
+            #     save_method = "merged_16bit",  # 或 "lora" / "quantized" 等
+            #     # 如果前面 dtype=torch.bfloat16，这里自然就是 bf16
+            # )
+            
+            self.use_lora = True
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
@@ -799,8 +917,25 @@ class GRPOTrainer(Trainer):
                     base_url = args.vllm_server_base_url
                 else:
                     base_url = f"http://{args.vllm_server_host}:{args.vllm_server_port}"
+                
                 self.vllm_client = VLLMClient(base_url=base_url, connection_timeout=args.vllm_server_timeout)
                 self.vllm_client.init_communicator(device=torch.cuda.current_device())
+                print(f'self.vllm_client.init_communicator: torch.cuda.current_device()={torch.cuda.current_device()}')
+                
+            elif self.vllm_mode == "openai":
+                from openai import OpenAI
+                apikey = "sk-vMg3ZMwRNibQlYUgQM1HEspt409zlwAfvAzVIupjUyCG2DHT"
+                baseurl = "https://api.moonshot.cn/v1"
+                self.openai_modelname = "kimi-k2-0711-preview"
+                
+                # apikey = "sk-5d855a5149c745f3ae9287430da10727"
+                # baseurl = "https://api.deepseek.com"
+                # self.openai_modelname = "deepseek-reasoner"
+                
+                self.vllm_client = OpenAI(
+                    api_key=apikey,
+                    base_url=baseurl
+                )
 
             elif self.vllm_mode == "colocate":
                 # Make sure vllm_tensor_parallel_size group size evenly divides the world size - each group should have
@@ -1085,6 +1220,8 @@ class GRPOTrainer(Trainer):
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
+        # batch_size=1
+        print(f'{datetime.now()} _get_per_token_logps_and_entropies(): input_ids.shape={input_ids.shape}, logits_to_keep={logits_to_keep}, batch_size={batch_size}...')
         for start in range(0, input_ids.size(0), batch_size):
             input_ids_batch = input_ids[start : start + batch_size]
             attention_mask_batch = attention_mask[start : start + batch_size]
@@ -1110,16 +1247,19 @@ class GRPOTrainer(Trainer):
                 model_inputs["logits_to_keep"] = logits_to_keep + 1
 
             logits = model(**model_inputs).logits
+            print(f'{datetime.now()} logits.shape={logits.shape}, logits_to_keep={logits_to_keep}')
             # Exclude the last value: it corresponds to the next token pred
             logits = logits[:, :-1, :]  # (B, L-1, H)
             # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
             logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
+
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
             logits = logits / self.temperature
 
             completion_ids = input_ids_batch[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
+            print(f'{datetime.now()} start={start}, completion_ids.shape={completion_ids.shape}, logits.shape={logits.shape}, logps.shape={logps.shape}')
             all_logps.append(logps)
 
             if compute_entropy:
@@ -1161,6 +1301,8 @@ class GRPOTrainer(Trainer):
 
                     if self.vllm_mode == "server" and self.accelerator.is_main_process:
                         self.vllm_client.update_named_param(full_name, param.data)
+                    elif self.vllm_mode == "openai":
+                        continue
                     elif self.vllm_mode == "colocate":
                         llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                         llm_model.load_weights([(full_name, param.data)])
@@ -1219,10 +1361,16 @@ class GRPOTrainer(Trainer):
                         # When module to save, remove its prefix and discard the original module
                         if "original_module" in name:
                             continue
+
                         name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+                        # if self.use_lora and "lora" not in name:
+                        #     continue
 
                         if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                            print(f'{datetime.now()} update_named_param: name={name}, param.data.shape={param.data.shape}, param.data={param.data}')
                             self.vllm_client.update_named_param(name, param.data)
+                        elif self.vllm_mode == "openai":
+                            continue
                         elif self.vllm_mode == "colocate":
                             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                             llm_model.load_weights([(name, param.data)])
@@ -1244,6 +1392,9 @@ class GRPOTrainer(Trainer):
                     with gather_if_zero3([param]):
                         if self.vllm_mode == "server" and self.accelerator.is_main_process:
                             self.vllm_client.update_named_param(name, param.data)
+                            print(f'{datetime.now()} _move_model_to_vllm(): name={name}, param={param}')
+                        elif self.vllm_mode == "openai":
+                            continue
                         elif self.vllm_mode == "colocate":
                             llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                             llm_model.load_weights([(name, param.data)])
@@ -1251,6 +1402,9 @@ class GRPOTrainer(Trainer):
         # Reset cache on vLLM
         if self.vllm_mode == "server" and self.accelerator.is_main_process:
             self.vllm_client.reset_prefix_cache()
+            print(f"{datetime.now()} _move_model_to_vllm(): reset_prefix_cache called on vLLM client")
+        elif self.vllm_mode == "openai":
+            print(f"{datetime.now()} _move_model_to_vllm(): reset_prefix_cache called on OpenAI client")
         elif self.vllm_mode == "colocate":
             self.llm.reset_prefix_cache()
 
@@ -1297,7 +1451,7 @@ class GRPOTrainer(Trainer):
         # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
         reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-
+        print(f'{datetime.now()} _calculate_rewards(): len(inputs)={len(inputs)}, prompts[0]={len(prompts[0])}-{prompts[0]}, completions[1]={len(completions[1])}-{completions[1]}, completion_ids_list[1]={len(completion_ids_list[1])}-{completion_ids_list[1]}')
         # This allows for dynamic reward shaping based on training progress.
         reward_kwargs["trainer_state"] = self.state
 
@@ -1319,12 +1473,13 @@ class GRPOTrainer(Trainer):
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
                     output_reward_func = reward_func(
-                        prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
+                        prompts=prompts, completions=completions, completion_ids=completion_ids_list, validator=self.validate_data, reason_quality_model=self.reason_quality_model, **reward_kwargs
                     )
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-
+                    print(f'{datetime.now()} _calculate_rewards(): i={i}, output_reward_func={output_reward_func}')
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                print(f'{datetime.now()} _calculate_rewards(): i={i}, rewards_per_func={rewards_per_func}')
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
@@ -1347,7 +1502,8 @@ class GRPOTrainer(Trainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
-
+        print(f'{datetime.now()} _generate_and_score_completions(): mode={mode}, len(inputs)={len(inputs)}, inputs[0]={inputs[0]}') # [a,a,a,a,b,b,b,b]
+        
         prompts = [x["prompt"] for x in inputs]
 
         # We don't yet support visual reward models/function, so we keep a copy of the original text-only prompts for
@@ -1388,7 +1544,8 @@ class GRPOTrainer(Trainer):
         )
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-
+        print(f'{datetime.now()} _generate_and_score_completions(): original prompt_ids={prompt_ids.shape}, prompt_mask={prompt_mask.shape}')
+        
         if self.max_prompt_length is not None:
             # If max_prompt_length is set, we trim the prompt to keep only the last `max_prompt_length` tokens.
             # Then we decode those tokens back into text. We manually remove leading pad tokens from the decoded text,
@@ -1402,6 +1559,7 @@ class GRPOTrainer(Trainer):
             prompts_text = self.processing_class.batch_decode(
                 prompt_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
             )
+
             prompts_text = [re.sub(rf"^({re.escape(self.pad_token)})+", "", text) for text in prompts_text]
 
             # The chat template inserts a single image token into the prompt text. However, when this text is later
@@ -1421,7 +1579,7 @@ class GRPOTrainer(Trainer):
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            if self.vllm_mode == "server":
+            if self.vllm_mode == "server" or self.vllm_mode == "openai":
                 all_prompts_text = gather_object(prompts_text)
                 if has_images:
                     all_images = gather_object(images)
@@ -1430,27 +1588,93 @@ class GRPOTrainer(Trainer):
                     # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
                     # num_generations outputs for each one. This is faster than generating outputs for each duplicate
                     # prompt individually.
-                    ordered_set_of_prompts = all_prompts_text[:: self.num_generations]
-
+                    print(f'{datetime.now()} all_prompts_text_len={len(all_prompts_text)}, all_prompts_text[:2]={all_prompts_text[:2]}') # [a,a,a,a,b,b,b,b]
+                    ordered_set_of_prompts = all_prompts_text[:: self.num_generations] # [a,a,b,b]
                     if has_images:
                         ordered_set_of_images = all_images[:: self.num_generations]
                     else:
                         ordered_set_of_images = None
-
+                        
+                    # for i in range(len(ordered_set_of_prompts)):
+                    #     ordered_set_of_prompts[i] = [
+                    #         {"role": "system", "content": "你是一个编程代码评价工程师，专门检查实时补全的代码是否正确，识别出那些错误补全的情况以方便后续改进代码补全模型。"},
+                    #         {"role": "user", "content": ordered_set_of_prompts[i]}
+                    #     ]
                     with profiling_context(self, "vLLM.generate"):
-                        completion_ids = self.vllm_client.generate(
-                            prompts=ordered_set_of_prompts,
-                            images=ordered_set_of_images,
-                            n=self.num_generations,
-                            repetition_penalty=self.repetition_penalty,
-                            temperature=self.temperature,
-                            top_p=self.top_p,
-                            top_k=-1 if self.top_k is None else self.top_k,
-                            min_p=0.0 if self.min_p is None else self.min_p,
-                            max_tokens=self.max_completion_length,
-                            guided_decoding_regex=self.guided_decoding_regex,
-                            generation_kwargs=self.args.generation_kwargs,
-                        )
+                        if self.vllm_mode == "server":
+                            rbegin = time.time()
+                            completion_ids = self.vllm_client.generate(
+                                prompts=ordered_set_of_prompts,
+                                n=self.num_generations,
+                                repetition_penalty=self.repetition_penalty,
+                                temperature=self.temperature,
+                                top_p=self.top_p,
+                                top_k=-1 if self.top_k is None else self.top_k,
+                                min_p=0.0 if self.min_p is None else self.min_p,
+                                max_tokens=self.max_completion_length,
+                                guided_decoding_regex=self.guided_decoding_regex,
+                                generation_kwargs=self.args.generation_kwargs,
+                            )
+                            print(f'{datetime.now()} _generate_and_score_completions(): {round(time.time()-rbegin,2)}s get the response from vLLM server: completion_ids={completion_ids[:2]}\n', flush=True)
+                            end_token = 151668
+                            for ci in range(len(completion_ids)):          # seq 是一维 list
+                                try:
+                                    idx = completion_ids[ci].index(end_token) # 找到 </think> 第一次出现位置
+                                    print(f'ci={ci}, len={len(completion_ids[ci])}, find_think_idx={idx}', flush=True)
+                                    completion_ids[ci] = completion_ids[ci][idx+1:]
+                                except ValueError:             # 该行没有 151668
+                                    print(f'{datetime.now()} _generate_and_score_completions(): completion_ids[{ci}] does not contain end_token={end_token}, keep the whole sequence', flush=True)
+                            # # 1. 找到每行第一次出现 151668 的位置，没有则返回该行长
+                            # idx = (completion_ids == end_token).int().argmax(dim=1)
+                            # # 如果某行没有 151668，argmax 返回 0，需特殊处理
+                            # has_end = (completion_ids == end_token).any(dim=1)
+                            # # 最终切片开始位置：有则 idx+1，无则 0
+                            # start = torch.where(has_end, idx + 1, torch.tensor(0, device=completion_ids.device))
+                            # print(f'{datetime.now()} _generate_and_score_completions(): idx={idx}, has_end={has_end}, start={start}')
+                            # # 2. 切片：用 advanced indexing 取出截断后的变长序列
+                            # truncated = [row[s:] for row, s in zip(completion_ids, start)] # truncated 现在是 List[Tensor]，长度不定
+                            # completion_ids = torch.nn.utils.rnn.pad_sequence(
+                            #     truncated, batch_first=True, padding_value=0
+                            # )
+                            print(f'{datetime.now()} _generate_and_score_completions(): after truncate, completion_ids[:1]={completion_ids[:1]}\n', flush=True)
+                        else:
+                            print(f'{datetime.now()} self.num_generations={self.num_generations}, ordered_set_of_prompts={ordered_set_of_prompts}')
+                            responses = []
+                            for i in range(len(ordered_set_of_prompts)):
+                                user_input = ordered_set_of_prompts[i]
+                                if '你是一个编程代码评价工程师，专门检查实时补全的代码是否正确，识别出那些错误补全的情况以方便后续改进代码补全模型。\n\n' in user_input:
+                                    user_input = user_input.replace('你是一个编程代码评价工程师，专门检查实时补全的代码是否正确，识别出那些错误补全的情况以方便后续改进代码补全模型。\n\n', '')
+                                    print(f'{datetime.now()} replace user_input={user_input}')
+                                msgs=[
+                                        {"role": "system", "content": "你是一个编程代码评价工程师，专门检查实时补全的代码是否正确，识别出那些错误补全的情况以方便后续改进代码补全模型。"},
+                                        {"role": "user", "content": user_input}
+                                    ]
+                                for j in range(self.num_generations):
+                                    rbegin = time.time()
+                                    if 'kimi' in self.openai_modelname:
+                                        response = self.vllm_client.chat.completions.create(
+                                            model=self.openai_modelname,
+                                            messages=msgs,
+                                            temperature = 0.3
+                                        )
+                                    else:
+                                        response = self.vllm_client.chat.completions.create(
+                                            model=self.openai_modelname,
+                                            messages=msgs
+                                        )
+                                    # completion_id = self.processing_class.encode(response.choices[0].message.content)
+                                    # completion_ids.append(completion_id)
+                                    responses.append(response)
+                                    print(f'{datetime.now()} _generate_and_score_completions(): {round(time.time()-rbegin,2)}s get the {i*self.num_generations+j+1} response from openai server: {response}\n', flush=True)
+                                    time.sleep(20)
+                            completion_ids = self.processing_class(
+                                [r.choices[0].message.content for r in responses],
+                                return_tensors="pt",
+                                padding=True,
+                                truncation=True
+                            ).input_ids
+                            print(f'{datetime.now()} _generate_and_score_completions(): completion_ids.shape={completion_ids.shape}\n')
+
                 else:
                     completion_ids = [None] * len(all_prompts_text)
                 # Broadcast the completions from the main process to all processes, ensuring each process receives its
@@ -1460,6 +1684,7 @@ class GRPOTrainer(Trainer):
                     self.accelerator.process_index * len(prompts),
                     (self.accelerator.process_index + 1) * len(prompts),
                 )
+                print(f'{datetime.now()} _generate_and_score_completions(): process_slice={process_slice}')
                 completion_ids = completion_ids[process_slice]
 
             # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
@@ -1525,7 +1750,9 @@ class GRPOTrainer(Trainer):
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+
             completion_ids = pad(completion_ids, padding_value=self.pad_token_id)
+            print(f'{datetime.now()} _generate_and_score_completions(): before cat, prompt_ids.shape={prompt_ids.shape}, completion_ids.shape={completion_ids.shape}')
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
 
         elif self.use_transformers_paged:
@@ -1610,6 +1837,15 @@ class GRPOTrainer(Trainer):
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         with torch.no_grad():
+            # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
+            # old_per_token_logps == per_token_logps, so we can skip it's computation here, and use
+            # per_token_logps.detach() instead.
+            print(f'{datetime.now()} num_iterations={self.num_iterations}, steps_per_generation={self.args.steps_per_generation}, gradient_accumulation_steps={self.args.gradient_accumulation_steps}')
+            # if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
+            #     old_per_token_logps = self._get_per_token_logps_and_entropies(
+            #         self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
+            #     )["logps"] # 老版本
+                
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
             # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
             # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
@@ -1628,6 +1864,7 @@ class GRPOTrainer(Trainer):
                     pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
                     image_sizes=prompt_inputs.get("image_sizes"),
                 )
+
             else:
                 old_per_token_logps = None
 
@@ -1670,7 +1907,8 @@ class GRPOTrainer(Trainer):
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
             completions = completions_text
-
+        print(f'{datetime.now()} _generate_and_score_completions(): completions_text[:2]={completions_text[:2]}')
+        
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
@@ -1737,7 +1975,7 @@ class GRPOTrainer(Trainer):
         for i, name in enumerate(self.reward_func_names):
             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._logs["advantages"].extend(all_process_advantages.tolist())
-
+        
         if has_images:
             self._logs["image"].extend(gather_object(images))
 
@@ -1760,6 +1998,8 @@ class GRPOTrainer(Trainer):
             output["pixel_attention_mask"] = prompt_inputs["pixel_attention_mask"]
         if "image_sizes" in prompt_inputs:
             output["image_sizes"] = prompt_inputs["image_sizes"]
+            
+        print(f'{datetime.now()} finish _generate_and_score_completions(): advantages={advantages.shape}, old_per_token_logps={old_per_token_logps}')
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -1879,11 +2119,13 @@ class GRPOTrainer(Trainer):
 
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2) # [1, 8192]
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
+            print(f'{datetime.now()} _compute_loss(): per_token_loss={per_token_loss}, per_token_kl={per_token_kl}, advantages={advantages}, coef_1={coef_1}, coef_2={coef_2}')
+            print(f'{datetime.now()} _compute_loss(): per_token_loss={per_token_loss.shape}, per_token_kl={per_token_kl.shape}, advantages={advantages.shape}, coef_1={coef_1.shape}, coef_2={coef_2.shape}')
 
         if self.loss_type == "grpo":
             loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
@@ -1929,6 +2171,7 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+        print(f'{datetime.now()} _compute_loss(): loss={loss}, gathered_low_clip={gathered_low_clip}, gathered_high_clip={gathered_high_clip}, gathered_clip_ratio={gathered_clip_ratio}')
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
@@ -2061,3 +2304,5 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+

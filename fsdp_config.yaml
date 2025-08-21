@@ -1,0 +1,26 @@
+compute_environment: LOCAL_MACHINE
+debug: true
+distributed_type: FSDP
+downcast_bf16: 'no'
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_offload_params: true  # offload may affect training speed 将不活动的模型参数卸载到 CPU，以减少 GPU 显存占用
+  fsdp_sharding_strategy: FULL_SHARD # 对模型参数、梯度和优化器状态进行完全分片，能最大程度减少每个 GPU 的显存占用
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: true
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16  # or fp16 使用混合精度训练可以减少显存占用，提升训练速度, bf16 比 fp16 更稳定
+num_machines: 2  # the number of nodes
+num_processes: 2  # the number of GPUs in all nodes
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+

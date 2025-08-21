@@ -527,8 +527,9 @@ def pad_to_length(tensor: torch.Tensor, length: int, pad_value: Union[int, float
 def disable_dropout_in_model(model: torch.nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
+            print(f'disable_dropout_in_model: set module.p = 0, module={module}')
             module.p = 0
-
+    print('call disable_dropout_in_model')
 
 def exact_div(a, b, custom_error_message=""):
     q = a // b
